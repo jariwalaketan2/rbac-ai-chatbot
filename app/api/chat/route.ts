@@ -1,56 +1,63 @@
-import { NextResponse, type NextRequest } from 'next/server';
+import { type NextRequest } from 'next/server';
 import { buildContextFromUserId } from '@/lib/auth/context';
-import { handleQuery } from '@/lib/orchestrator/handler';
+import { streamQuery } from '@/lib/orchestrator/handler';
+import { warmDb } from '@/lib/db/client';
 
 export const runtime = 'nodejs';
+export const maxDuration = 600;
 
 export async function POST(req: NextRequest) {
   const userId = req.headers.get('x-user-id');
   if (!userId) {
-    return NextResponse.json(
-      { error: 'Missing x-user-id header' },
-      { status: 401 },
-    );
+    return Response.json({ error: 'Missing x-user-id header' }, { status: 401 });
   }
 
   const ctx = await buildContextFromUserId(userId);
   if (!ctx) {
-    return NextResponse.json({ error: 'Unknown user' }, { status: 401 });
+    return Response.json({ error: 'Unknown user' }, { status: 401 });
   }
 
-  const body = (await req.json().catch(() => null)) as {
-    message?: unknown;
-  } | null;
+  const body = (await req.json().catch(() => null)) as { message?: unknown } | null;
   const message = body?.message;
   if (typeof message !== 'string' || !message.trim()) {
-    return NextResponse.json(
-      { error: 'Body must be { message: string }' },
-      { status: 400 },
-    );
+    return Response.json({ error: 'Body must be { message: string }' }, { status: 400 });
   }
 
-  try {
-    const result = await handleQuery(message.trim(), ctx);
-    return NextResponse.json(result);
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    console.error('[/api/chat] error:', detail);
+  await warmDb();
 
-    // Detect rate-limit / quota errors from any LLM provider and surface a
-    // 429 so the UI can show a clean "try again" message instead of a 500.
-    const isRateLimit =
-      /quota|rate.?limit|429|too many requests|resource.?exhausted/i.test(detail);
+  const encoder = new TextEncoder();
 
-    if (isRateLimit) {
-      return NextResponse.json(
-        { error: 'RATE_LIMITED', message: 'The AI service is temporarily busy. Please wait a moment and try again.' },
-        { status: 429 },
-      );
-    }
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        for await (const event of streamQuery(message.trim(), ctx)) {
+          controller.enqueue(encoder.encode(JSON.stringify(event) + '\n'));
+        }
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        console.error('[/api/chat] error:', detail);
+        const isRateLimit = /quota|rate.?limit|429|too many requests/i.test(detail);
+        controller.enqueue(
+          encoder.encode(
+            JSON.stringify({
+              type: 'error',
+              message: isRateLimit
+                ? 'The AI service is temporarily busy. Please wait and try again.'
+                : 'Something went wrong. Please try again.',
+              retryable: isRateLimit || /fetch failed|timeout/i.test(detail),
+            }) + '\n',
+          ),
+        );
+      } finally {
+        controller.close();
+      }
+    },
+  });
 
-    return NextResponse.json(
-      { error: 'Orchestrator failure', message: 'Something went wrong. Please try again.' },
-      { status: 500 },
-    );
-  }
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'application/x-ndjson',
+      'Cache-Control': 'no-cache',
+    },
+  });
 }

@@ -1,32 +1,23 @@
-import type { LanguageModel } from 'ai';
-import { google } from '@ai-sdk/google';
-import { anthropic } from '@ai-sdk/anthropic';
-import { openai } from '@ai-sdk/openai';
+import { ChatOllama } from '@langchain/ollama';
 
-/**
- * Resolve the LLM at runtime from env vars. Pick the first provider whose
- * key is set. LLM_MODEL overrides the default model id for that provider.
- */
-export function getModel(): LanguageModel {
-  const explicit = process.env.LLM_MODEL;
+// Module-level singleton — avoids reconstructing the client on every request.
+let _model: ChatOllama | null = null;
 
-  if (process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
-    return google(explicit ?? 'gemini-flash-latest');
+export function getModel(): ChatOllama {
+  if (!_model) {
+    _model = new ChatOllama({
+      model: process.env.OLLAMA_MODEL ?? 'qwen2.5:3b',
+      baseUrl: process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434',
+      temperature: 0,
+      numCtx: 2048,
+      numThread: 2,
+      numPredict: 256,
+      keepAlive: '10m',
+    });
   }
-  if (process.env.ANTHROPIC_API_KEY) {
-    return anthropic(explicit ?? 'claude-haiku-4-5');
-  }
-  if (process.env.OPENAI_API_KEY) {
-    return openai(explicit ?? 'gpt-4o-mini');
-  }
-  throw new Error(
-    'No LLM provider configured. Set one of GOOGLE_GENERATIVE_AI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY in .env.local',
-  );
+  return _model;
 }
 
 export function getActiveProvider(): string {
-  if (process.env.GOOGLE_GENERATIVE_AI_API_KEY) return 'google';
-  if (process.env.ANTHROPIC_API_KEY) return 'anthropic';
-  if (process.env.OPENAI_API_KEY) return 'openai';
-  return 'none';
+  return `ollama/${process.env.OLLAMA_MODEL ?? 'qwen2.5:3b'}`;
 }

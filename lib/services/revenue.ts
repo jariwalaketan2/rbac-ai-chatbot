@@ -11,11 +11,15 @@ export type RevenueReportArgs = {
   type?: TxnType;
 };
 
+function formatUSD(n: number): string {
+  return '$' + Math.round(n).toLocaleString('en-US');
+}
+
 export type RevenueReport = {
   orgId: string;
   timeRange: TimeRange;
   filters: { region: Region | null; type: TxnType | null };
-  totalRevenue: number;
+  totalRevenue: string;
   transactionCount: number;
   currency: 'USD';
 };
@@ -45,7 +49,7 @@ export async function getRevenueReport(
     orgId: ctx.orgId,
     timeRange: args.timeRange,
     filters: { region, type },
-    totalRevenue: rows[0].total,
+    totalRevenue: formatUSD(rows[0].total),
     transactionCount: rows[0].count,
     currency: 'USD',
   };
@@ -60,7 +64,7 @@ export type Breakdown = {
   orgId: string;
   timeRange: TimeRange;
   groupBy: 'region' | 'month';
-  rows: Array<{ key: string; total: number; count: number }>;
+  rows: Array<{ key: string; total: string; count: number }>;
 };
 
 export async function getRevenueBreakdown(
@@ -94,6 +98,6 @@ export async function getRevenueBreakdown(
     orgId: ctx.orgId,
     timeRange: args.timeRange,
     groupBy: args.groupBy,
-    rows,
+    rows: rows.map((r) => ({ ...r, total: formatUSD(r.total) })),
   };
 }
