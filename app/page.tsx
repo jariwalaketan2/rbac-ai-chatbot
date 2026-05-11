@@ -310,7 +310,9 @@ export default function Home() {
                     {resp.provider} · {resp.steps} step{resp.steps !== 1 ? 's' : ''}
                   </span>
                 </div>
-                <div className="answer-text">{resp.text}</div>
+                <div className="answer-text">
+                  {resp.text || (busy ? <span style={{ opacity: 0.4 }}>Thinking…</span> : '')}
+                </div>
               </div>
             </section>
 
