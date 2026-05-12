@@ -6,12 +6,12 @@ let _model: ChatOllama | null = null;
 export function getModel(): ChatOllama {
   if (!_model) {
     _model = new ChatOllama({
-      model: process.env.OLLAMA_MODEL ?? 'qwen2.5:3b',
+      model: process.env.OLLAMA_MODEL ?? 'qwen3.5:9b',
       baseUrl: process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434',
       temperature: 0,
-      numCtx: 2048,
+      numCtx: 4096,
       numThread: 2,
-      numPredict: 256,
+      numPredict: 1024,
       keepAlive: '10m',
     });
   }
@@ -19,5 +19,5 @@ export function getModel(): ChatOllama {
 }
 
 export function getActiveProvider(): string {
-  return `ollama/${process.env.OLLAMA_MODEL ?? 'qwen2.5:3b'}`;
+  return `ollama/${process.env.OLLAMA_MODEL ?? 'qwen3.5:9b'}`;
 }

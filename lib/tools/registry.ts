@@ -84,7 +84,7 @@ const REGISTRY: Record<string, ToolDef> = {
         {
           name: 'getRevenueReport',
           description:
-            "Get total revenue (sales minus refunds) for the caller's organization over a time range, optionally filtered by region or transaction type. Returns a single aggregate.",
+            "Get total revenue (sales minus refunds) for the caller's organization over a time range, optionally filtered by region or transaction type. Returns a single aggregate. Input must be { timeRange: { preset: '...' } } — always wrap preset inside timeRange.",
           schema: z.object({
             timeRange: timeRangeSchema,
             region: regionSchema.optional(),
