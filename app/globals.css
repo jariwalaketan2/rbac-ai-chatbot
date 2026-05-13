@@ -492,3 +492,113 @@ body::before {
 
 /* ─── Focus ────────────────────────────────────────────── */
 *:focus-visible { outline: 2px solid var(--accent-mid); outline-offset: 2px; }
+
+/* ─── LLM Trace ─────────────────────────────────────────── */
+.trace-eyebrow { display: flex; justify-content: space-between; align-items: center; }
+.trace-toggle  { font-size: 10px; color: var(--text-2); letter-spacing: .05em; }
+
+.trace-card { padding: 0; overflow: hidden; }
+
+.trace-step {
+  border-bottom: 1px solid var(--border);
+  padding: 14px 18px;
+}
+.trace-step:last-child { border-bottom: none; }
+.trace-step-err { background: var(--red-lo); }
+.trace-step-ok  { background: var(--green-lo); }
+
+.trace-step-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.trace-idx {
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  background: var(--border-hi);
+  color: var(--text);
+  font-size: 11px;
+  font-family: var(--mono);
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.trace-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  color: var(--text-2);
+}
+.trace-badge {
+  font-size: 10px;
+  font-family: var(--mono);
+  padding: 2px 8px;
+  border-radius: 4px;
+  letter-spacing: .04em;
+}
+.trace-badge-model { background: var(--blue-lo);   color: var(--blue); }
+.trace-badge-tool  { background: var(--accent-lo); color: var(--accent); }
+.trace-badge-ok    { background: var(--green-lo);  color: var(--green); }
+.trace-badge-err   { background: var(--red-lo);    color: var(--red); }
+
+.trace-body { display: flex; flex-direction: column; gap: 8px; padding-left: 32px; }
+
+.trace-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 12px;
+}
+.trace-row-block { flex-direction: column; gap: 6px; }
+
+.trace-key {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  color: var(--text-2);
+  min-width: 130px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.trace-val   { color: var(--text); font-size: 12px; }
+.trace-dim   { color: var(--text-3); font-size: 11px; }
+.trace-err-text { color: var(--red); }
+
+.trace-expand-btn {
+  background: var(--border);
+  border: none;
+  color: var(--text-2);
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  letter-spacing: .06em;
+}
+.trace-expand-btn:hover { background: var(--border-hi); color: var(--text); }
+
+.trace-prompt-pre {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 11px;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.6;
+  max-height: 300px;
+  overflow-y: auto;
+  width: 100%;
+}
+.trace-err-pre { border-color: var(--red); background: var(--red-lo); color: var(--red); }
+
+.trace-tool-list { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.trace-tool-row  { display: flex; gap: 10px; align-items: baseline; }
+.trace-tool-name {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--accent);
+  min-width: 160px;
+}
+.trace-tool-desc { font-size: 11px; color: var(--text-2); line-height: 1.5; }

@@ -17,6 +17,7 @@
     "@langchain/core": "^1.1.45",
     "@langchain/langgraph": "^1.3.0",
     "@langchain/ollama": "^1.2.7",
+    "@langchain/openai": "^1.4.5",
     "@neondatabase/serverless": "^0.10.4",
     "ai": "^5.0.0",
     "next": "^15.1.0",

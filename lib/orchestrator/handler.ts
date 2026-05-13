@@ -10,11 +10,15 @@ import type { RefusalReason } from './refusal';
 export type ToolCallSummary = { name: string; args: unknown };
 export type ToolResultSummary = { name: string; result: unknown };
 
+export type ToolSchema = { name: string; description: string };
+
 export type StreamEvent =
   | { type: 'metadata'; provider: string; availableTools: string[] }
+  | { type: 'debug'; systemPrompt: string; toolSchemas: ToolSchema[] }
   | { type: 'tool_call'; name: string; args: unknown }
   | { type: 'tool_result'; name: string; result: unknown }
   | { type: 'text_chunk'; text: string }
+  | { type: 'guard'; fired: boolean; reason?: string; textSample?: string }
   | { type: 'done'; steps: number; refusal: { reason: RefusalReason; details?: string } | null; usedFinalize: boolean };
 
 export type ChatResponse = {
@@ -37,12 +41,18 @@ export async function* streamQuery(
   const availableTools = listAvailableToolNames(ctx);
   const dataTools = listAvailableDataToolNames(ctx);
   const systemPrompt = buildSystemPrompt({ orgId: ctx.orgId, role: ctx.role, availableTools });
+  const boundTools = getToolsForContext(ctx);
+  const toolSchemas: ToolSchema[] = boundTools.map((t) => ({
+    name: t.name,
+    description: (t as { description?: string }).description ?? '',
+  }));
 
   yield { type: 'metadata', provider: getActiveProvider(), availableTools };
+  yield { type: 'debug', systemPrompt, toolSchemas };
 
   const agent = createReactAgent({
     llm: getModel(),
-    tools: getToolsForContext(ctx),
+    tools: boundTools,
     stateModifier: systemPrompt,
   });
 
@@ -71,7 +81,8 @@ export async function* streamQuery(
         }
         // Final answer — no tool calls in this message
         if (!msg.tool_calls?.length) {
-          const text = typeof msg.content === 'string' ? msg.content : '';
+          const raw = typeof msg.content === 'string' ? msg.content : '';
+          const text = raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
           if (text) {
             textBuffer = text;
             yield { type: 'text_chunk', text };
@@ -96,7 +107,16 @@ export async function* streamQuery(
 
   // Hallucination guard: numeric claim with no data tool called this turn
   const dataCallsMade = toolCalls.filter((c) => dataTools.includes(c.name));
-  if (dataCallsMade.length === 0 && HALLUCINATION_PATTERN.test(textBuffer)) {
+  const guardFired = dataCallsMade.length === 0 && HALLUCINATION_PATTERN.test(textBuffer);
+
+  yield {
+    type: 'guard',
+    fired: guardFired,
+    reason: guardFired ? 'Response contained numbers/amounts but no data tool was called' : undefined,
+    textSample: guardFired ? textBuffer.slice(0, 300) : undefined,
+  };
+
+  if (guardFired) {
     yield { type: 'done', steps, refusal: { reason: 'OUT_OF_SCOPE', details: 'no backing tool result' }, usedFinalize: false };
     return;
   }

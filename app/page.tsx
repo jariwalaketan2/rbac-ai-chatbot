@@ -26,11 +26,19 @@ type ChatResponse = {
   steps: number;
 };
 
+type ToolSchema = { name: string; description: string };
+
+type GuardInfo = { fired: boolean; reason?: string; textSample?: string };
+
+type DebugInfo = { systemPrompt: string; toolSchemas: ToolSchema[] };
+
 type StreamEvent =
   | { type: 'metadata'; provider: string; availableTools: string[] }
+  | { type: 'debug'; systemPrompt: string; toolSchemas: ToolSchema[] }
   | { type: 'tool_call'; name: string; args: unknown }
   | { type: 'tool_result'; name: string; result: unknown }
   | { type: 'text_chunk'; text: string }
+  | { type: 'guard'; fired: boolean; reason?: string; textSample?: string }
   | { type: 'done'; steps: number; refusal: ChatResponse['refusal']; usedFinalize: boolean }
   | { type: 'error'; message: string; retryable: boolean };
 
@@ -58,6 +66,10 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [resp, setResp] = useState<ChatResponse | null>(null);
   const [error, setError] = useState<{ message: string; retryable: boolean } | null>(null);
+  const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null);
+  const [guardInfo, setGuardInfo] = useState<GuardInfo | null>(null);
+  const [promptExpanded, setPromptExpanded] = useState(false);
+  const [traceExpanded, setTraceExpanded] = useState(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const responseRef = useRef<HTMLDivElement>(null);
 
@@ -80,6 +92,9 @@ export default function Home() {
     setBusy(true);
     setError(null);
     setResp(null);
+    setDebugInfo(null);
+    setGuardInfo(null);
+    setPromptExpanded(false);
 
     try {
       const r = await fetch('/api/chat', {
@@ -119,6 +134,9 @@ export default function Home() {
               setResp((p) => p && { ...p, provider: event.provider, availableTools: event.availableTools });
               setTimeout(() => responseRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
               break;
+            case 'debug':
+              setDebugInfo({ systemPrompt: event.systemPrompt, toolSchemas: event.toolSchemas });
+              break;
             case 'tool_call':
               setResp((p) => p && { ...p, toolCalls: [...p.toolCalls, { name: event.name, args: event.args }] });
               break;
@@ -127,6 +145,9 @@ export default function Home() {
               break;
             case 'text_chunk':
               setResp((p) => p && { ...p, text: p.text + event.text });
+              break;
+            case 'guard':
+              setGuardInfo({ fired: event.fired, reason: event.reason, textSample: event.textSample });
               break;
             case 'done':
               setResp((p) => {
@@ -359,6 +380,144 @@ export default function Home() {
                 )}
               </div>
             </section>
+
+            {/* LLM Trace */}
+            {debugInfo && (
+              <section className="section">
+                <div className="eyebrow trace-eyebrow" onClick={() => setTraceExpanded(p => !p)} style={{ cursor: 'pointer' }}>
+                  LLM TRACE — WHAT WAS SENT &amp; RECEIVED
+                  <span className="trace-toggle">{traceExpanded ? '▲ collapse' : '▼ expand'}</span>
+                </div>
+                {traceExpanded && (
+                  <div className="card trace-card">
+
+                    {/* Step 0: Context sent */}
+                    <div className="trace-step">
+                      <div className="trace-step-label">
+                        <span className="trace-idx">0</span>
+                        <span className="trace-title">CONTEXT SENT TO MODEL</span>
+                        <span className="trace-badge trace-badge-model">{resp.provider}</span>
+                      </div>
+                      <div className="trace-body">
+                        <div className="trace-row">
+                          <span className="trace-key">User message</span>
+                          <span className="trace-val mono">&quot;{message}&quot;</span>
+                        </div>
+                        <div className="trace-row">
+                          <span className="trace-key">Tools bound</span>
+                          <span className="trace-val">
+                            {debugInfo.toolSchemas.map(t => (
+                              <span key={t.name} className="tag" style={{ marginRight: 4 }}>{t.name}</span>
+                            ))}
+                            <span className="trace-dim">({debugInfo.toolSchemas.length} total)</span>
+                          </span>
+                        </div>
+                        <div className="trace-row trace-row-block">
+                          <span className="trace-key">
+                            System prompt
+                            <button className="trace-expand-btn" onClick={() => setPromptExpanded(p => !p)}>
+                              {promptExpanded ? 'hide' : 'show'}
+                            </button>
+                          </span>
+                          {promptExpanded && (
+                            <pre className="trace-prompt-pre">{debugInfo.systemPrompt}</pre>
+                          )}
+                        </div>
+                        <div className="trace-row trace-row-block">
+                          <span className="trace-key">Tool schemas</span>
+                          <div className="trace-tool-list">
+                            {debugInfo.toolSchemas.map(t => (
+                              <div key={t.name} className="trace-tool-row">
+                                <span className="trace-tool-name">{t.name}</span>
+                                <span className="trace-tool-desc">{t.description}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Steps 1..N: tool calls + results */}
+                    {resp.toolCalls.map((tc, i) => (
+                      <div key={i} className="trace-step">
+                        <div className="trace-step-label">
+                          <span className="trace-idx">{i + 1}</span>
+                          <span className="trace-title">MODEL DECISION — TOOL CALL</span>
+                          <span className="trace-badge trace-badge-tool">{tc.name}</span>
+                        </div>
+                        <div className="trace-body">
+                          <div className="trace-row trace-row-block">
+                            <span className="trace-key">Arguments sent to tool</span>
+                            <pre className="p-args">{JSON.stringify(tc.args, null, 2)}</pre>
+                          </div>
+                          {resp.toolResults[i] && (
+                            <div className="trace-row trace-row-block">
+                              <span className="trace-key">Tool returned</span>
+                              <pre className="p-result">
+                                {JSON.stringify(resp.toolResults[i].result, null, 2)}
+                              </pre>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+
+                    {/* Final LLM response */}
+                    {resp.text && !resp.refusal && (
+                      <div className="trace-step">
+                        <div className="trace-step-label">
+                          <span className="trace-idx">{resp.toolCalls.length + 1}</span>
+                          <span className="trace-title">MODEL FINAL RESPONSE</span>
+                          <span className="trace-badge trace-badge-ok">text</span>
+                        </div>
+                        <div className="trace-body">
+                          <div className="trace-row trace-row-block">
+                            <span className="trace-key">Raw output</span>
+                            <pre className="trace-prompt-pre">{resp.text}</pre>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Guard check */}
+                    {guardInfo && (
+                      <div className={`trace-step ${guardInfo.fired ? 'trace-step-err' : 'trace-step-ok'}`}>
+                        <div className="trace-step-label">
+                          <span className="trace-idx">{guardInfo.fired ? '!' : '✓'}</span>
+                          <span className="trace-title">HALLUCINATION GUARD</span>
+                          <span className={`trace-badge ${guardInfo.fired ? 'trace-badge-err' : 'trace-badge-ok'}`}>
+                            {guardInfo.fired ? 'BLOCKED' : 'PASSED'}
+                          </span>
+                        </div>
+                        {guardInfo.fired && (
+                          <div className="trace-body">
+                            <div className="trace-row">
+                              <span className="trace-key">Why blocked</span>
+                              <span className="trace-val trace-err-text">{guardInfo.reason}</span>
+                            </div>
+                            <div className="trace-row">
+                              <span className="trace-key">Pattern</span>
+                              <code className="trace-val mono">/\$\d|\b\d&#123;2,&#125;\b/</code>
+                            </div>
+                            {guardInfo.textSample && (
+                              <div className="trace-row trace-row-block">
+                                <span className="trace-key">Model output that triggered it</span>
+                                <pre className="trace-prompt-pre trace-err-pre">{guardInfo.textSample}</pre>
+                              </div>
+                            )}
+                            <div className="trace-row">
+                              <span className="trace-key">Fix</span>
+                              <span className="trace-val">Model must call a data tool before stating any numbers</span>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                  </div>
+                )}
+              </section>
+            )}
           </div>
         )}
       </div>
