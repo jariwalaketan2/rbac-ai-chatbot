@@ -1,6 +1,5 @@
 import { createReactAgent } from '@langchain/langgraph/prebuilt';
 import { HumanMessage } from '@langchain/core/messages';
-import type { AIMessage, ToolMessage } from '@langchain/core/messages';
 import type { Context } from '../auth/context';
 import { getModel, getActiveProvider } from '../llm/model';
 import { getToolsForContext, listAvailableToolNames, listAvailableDataToolNames } from '../tools/registry';
@@ -18,6 +17,7 @@ export type StreamEvent =
   | { type: 'tool_call'; name: string; args: unknown }
   | { type: 'tool_result'; name: string; result: unknown }
   | { type: 'text_chunk'; text: string }
+  | { type: 'thinking_chunk'; text: string }
   | { type: 'guard'; fired: boolean; reason?: string; textSample?: string }
   | { type: 'done'; steps: number; refusal: { reason: RefusalReason; details?: string } | null; usedFinalize: boolean };
 
@@ -61,49 +61,119 @@ export async function* streamQuery(
   let textBuffer = '';
   let steps = 0;
 
-  // streamMode:'updates' gives complete node outputs — no chunk assembly needed.
-  // LangGraph still calls ChatOllama.stream() internally, keeping the Ollama
-  // connection alive with token chunks (resets write-timeout each chunk).
-  const stream = await agent.stream(
-    { messages: [new HumanMessage(message)] },
-    { streamMode: 'updates', recursionLimit: 25 },
-  );
+  type Chunk = {
+    _getType?(): string;
+    content?: unknown;
+    tool_call_chunks?: Array<{ id?: string; name?: string; args?: string; index?: number }>;
+    name?: string;
+  };
 
-  for await (const update of stream as AsyncIterable<Record<string, { messages: unknown[] }>>) {
-    steps++;
+  // Pending tool calls assembled from streaming chunks (id → {name, args})
+  const pendingCalls = new Map<string, { name: string; args: string }>();
+  const emittedIds = new Set<string>();
 
-    if (update.agent) {
-      for (const msg of update.agent.messages as AIMessage[]) {
-        // Tool calls this step
-        for (const tc of msg.tool_calls ?? []) {
-          toolCalls.push({ name: tc.name, args: tc.args });
-          yield { type: 'tool_call', name: tc.name, args: tc.args };
-        }
-        // Final answer — no tool calls in this message
-        if (!msg.tool_calls?.length) {
-          const raw = typeof msg.content === 'string' ? msg.content : '';
-          const text = raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-          if (text) {
-            textBuffer = text;
-            yield { type: 'text_chunk', text };
-          }
-        }
-      }
-    }
+  // Real-time <think>...</think> splitter: text_chunk for visible output,
+  // thinking_chunk for think-block tokens (forwarded to keep Cloudflare alive,
+  // ignored by the frontend switch statement).
+  let tagBuf = '';
+  let inThink = false;
 
-    if (update.tools) {
-      for (const tm of update.tools.messages as ToolMessage[]) {
-        let result: unknown;
-        try {
-          result = typeof tm.content === 'string' ? JSON.parse(tm.content) : tm.content;
-        } catch {
-          result = tm.content;
+  async function* emitTokens(token: string, final = false): AsyncGenerator<StreamEvent> {
+    tagBuf += token;
+    for (;;) {
+      if (inThink) {
+        const end = tagBuf.indexOf('</think>');
+        if (end >= 0) {
+          if (end > 0) yield { type: 'thinking_chunk', text: tagBuf.slice(0, end) };
+          tagBuf = tagBuf.slice(end + 8);
+          inThink = false;
+        } else {
+          const safe = final ? tagBuf.length : Math.max(0, tagBuf.length - 8);
+          if (safe > 0) { yield { type: 'thinking_chunk', text: tagBuf.slice(0, safe) }; tagBuf = tagBuf.slice(safe); }
+          break;
         }
-        toolResults.push({ name: tm.name ?? '', result });
-        yield { type: 'tool_result', name: tm.name ?? '', result };
+      } else {
+        const start = tagBuf.indexOf('<think>');
+        if (start >= 0) {
+          if (start > 0) { const out = tagBuf.slice(0, start); textBuffer += out; yield { type: 'text_chunk', text: out }; }
+          tagBuf = tagBuf.slice(start + 7);
+          inThink = true;
+        } else {
+          const safe = final ? tagBuf.length : Math.max(0, tagBuf.length - 7);
+          if (safe > 0) { const out = tagBuf.slice(0, safe); textBuffer += out; yield { type: 'text_chunk', text: out }; tagBuf = tagBuf.slice(safe); }
+          break;
+        }
       }
     }
   }
+
+  // streamMode:'messages' yields one [chunk, metadata] tuple per token,
+  // keeping data flowing to the client (and through Cloudflare) continuously.
+  const stream = await agent.stream(
+    { messages: [new HumanMessage(`/no_think ${message}`)] },
+    { streamMode: 'messages', recursionLimit: 25 },
+  );
+
+  for await (const [chunk, metadata] of stream as AsyncIterable<[Chunk, { langgraph_node: string }]>) {
+    const node = (metadata as { langgraph_node: string }).langgraph_node;
+
+    // Tool results arrive as complete ToolMessage objects from the tools node
+    if (node === 'tools') {
+      steps++;
+      // Flush any pending tool calls before emitting the result
+      for (const [id, tc] of pendingCalls) {
+        if (!emittedIds.has(id)) {
+          let args: unknown;
+          try { args = JSON.parse(tc.args); } catch { args = tc.args; }
+          toolCalls.push({ name: tc.name, args });
+          yield { type: 'tool_call', name: tc.name, args };
+          emittedIds.add(id);
+        }
+      }
+      pendingCalls.clear();
+
+      const raw = typeof chunk.content === 'string' ? chunk.content : JSON.stringify(chunk.content ?? '');
+      let result: unknown;
+      try { result = JSON.parse(raw); } catch { result = raw; }
+      const name = chunk.name ?? '';
+      toolResults.push({ name, result });
+      yield { type: 'tool_result', name, result };
+      continue;
+    }
+
+    if (node !== 'agent') continue;
+
+    // Accumulate tool call argument chunks
+    for (const tc of chunk.tool_call_chunks ?? []) {
+      const id = tc.id ?? String(tc.index ?? '0');
+      if (tc.name) {
+        pendingCalls.set(id, { name: tc.name, args: tc.args ?? '' });
+      } else if (tc.args) {
+        const existing = pendingCalls.get(id);
+        if (existing) existing.args += tc.args;
+      }
+    }
+
+    // Stream text tokens — thinking tokens forwarded as thinking_chunk (keeps
+    // Cloudflare connection alive), visible tokens forwarded as text_chunk.
+    const token = typeof chunk.content === 'string' ? chunk.content : '';
+    if (token) yield* emitTokens(token);
+  }
+
+  // Flush any partial tag remaining in the buffer
+  yield* emitTokens('', true);
+
+  // Emit tool calls not yet emitted (edge case: no tool result followed them)
+  for (const [id, tc] of pendingCalls) {
+    if (!emittedIds.has(id)) {
+      let args: unknown;
+      try { args = JSON.parse(tc.args); } catch { args = tc.args; }
+      toolCalls.push({ name: tc.name, args });
+      yield { type: 'tool_call', name: tc.name, args };
+    }
+  }
+
+  steps += toolCalls.length === 0 ? 1 : 2;
 
   // Hallucination guard: numeric claim with no data tool called this turn
   const dataCallsMade = toolCalls.filter((c) => dataTools.includes(c.name));

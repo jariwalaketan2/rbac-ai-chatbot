@@ -21,6 +21,9 @@ export type RevenueReport = {
   filters: { region: Region | null; type: TxnType | null };
   totalRevenue: string;
   transactionCount: number;
+  averageAmount: string;
+  maxAmount: string;
+  minAmount: string;
   currency: 'USD';
 };
 
@@ -35,7 +38,10 @@ export async function getRevenueReport(
   const rows = (await sql(
     `SELECT
        COALESCE(SUM(amount * CASE WHEN type = 'refund' THEN -1 ELSE 1 END), 0)::float8 AS total,
-       COUNT(*)::int AS count
+       COUNT(*)::int                                                                      AS count,
+       COALESCE(AVG(amount), 0)::float8                                                  AS avg,
+       COALESCE(MAX(amount), 0)::float8                                                  AS max,
+       COALESCE(MIN(amount), 0)::float8                                                  AS min
      FROM transactions
      WHERE org_id = $1
        AND ($2::timestamptz IS NULL OR occurred_at >= $2)
@@ -43,7 +49,7 @@ export async function getRevenueReport(
        AND ($4::text         IS NULL OR region      = $4)
        AND ($5::text         IS NULL OR type        = $5)`,
     [ctx.orgId, from, to, region, type],
-  )) as Array<{ total: number; count: number }>;
+  )) as Array<{ total: number; count: number; avg: number; max: number; min: number }>;
 
   return {
     orgId: ctx.orgId,
@@ -51,19 +57,22 @@ export async function getRevenueReport(
     filters: { region, type },
     totalRevenue: formatUSD(rows[0].total),
     transactionCount: rows[0].count,
+    averageAmount: formatUSD(rows[0].avg),
+    maxAmount: formatUSD(rows[0].max),
+    minAmount: formatUSD(rows[0].min),
     currency: 'USD',
   };
 }
 
 export type BreakdownArgs = {
   timeRange: TimeRange;
-  groupBy: 'region' | 'month';
+  groupBy: string;
 };
 
 export type Breakdown = {
   orgId: string;
   timeRange: TimeRange;
-  groupBy: 'region' | 'month';
+  groupBy: string;
   rows: Array<{ key: string; total: string; count: number }>;
 };
 
@@ -71,14 +80,16 @@ export async function getRevenueBreakdown(
   args: BreakdownArgs,
   ctx: Context,
 ): Promise<Breakdown> {
-  // Defense-in-depth: even though Zod gates this, the service re-validates.
-  if (args.groupBy !== 'region' && args.groupBy !== 'month') {
-    throw new Error('Invalid groupBy');
-  }
-
   const { from, to } = resolveTimeRange(args.timeRange);
-  const groupExpr =
-    args.groupBy === 'region' ? 'region' : "to_char(occurred_at, 'YYYY-MM')";
+  const GROUP_EXPRS: Record<string, string> = {
+    region:  'region',
+    type:    'type',
+    month:   "to_char(occurred_at, 'YYYY-MM')",
+    quarter: "to_char(occurred_at, 'YYYY-\"Q\"Q')",
+    year:    "to_char(occurred_at, 'YYYY')",
+  };
+  const groupExpr = GROUP_EXPRS[args.groupBy];
+  if (!groupExpr) throw new Error(`Unsupported groupBy "${args.groupBy}". Valid values: region, month, year, quarter, type.`);
 
   const rows = (await sql(
     `SELECT

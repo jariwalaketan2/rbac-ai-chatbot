@@ -6,30 +6,11 @@ import { audit } from '../audit/log';
 import { getRevenueReport, getRevenueBreakdown, type RevenueReportArgs, type BreakdownArgs } from '../services/revenue';
 import { listTransactions, type ListTransactionsArgs } from '../services/transactions';
 import { getUserDetails, listUsers, type GetUserDetailsArgs, type ListUsersArgs } from '../services/users';
+import { PAGE_SIZE } from '../services/transactions';
 
 const timeRangeSchema = z.object({
-  preset: z.enum([
-    'LAST_QUARTER',
-    'CURRENT_QUARTER',
-    'YEAR_TO_DATE',
-    'ALL_TIME',
-    'LAST_30_DAYS',
-    'LAST_90_DAYS',
-    'LAST_12_MONTHS',
-    'CUSTOM',
-  ]).describe(
-    'Pick the preset that best matches the user\'s phrasing. ' +
-    'LAST_QUARTER=previous calendar quarter; ' +
-    'CURRENT_QUARTER=this quarter (not the full year); ' +
-    'YEAR_TO_DATE=this year / so far this year / since January; ' +
-    'ALL_TIME=all time / ever / no date filter; ' +
-    'LAST_30_DAYS=last 30 days / past month; ' +
-    'LAST_90_DAYS=last 90 days / past 3 months; ' +
-    'LAST_12_MONTHS=last 12 months / past year; ' +
-    'CUSTOM=specific date range (requires from+to).'
-  ),
-  from: z.string().optional().describe('ISO date YYYY-MM-DD. Required if preset is CUSTOM.'),
-  to: z.string().optional().describe('ISO date YYYY-MM-DD. Required if preset is CUSTOM.'),
+  from: z.string().optional().describe('ISO date YYYY-MM-DD. Omit for no lower bound (all history).'),
+  to:   z.string().optional().describe('ISO date YYYY-MM-DD. Omit for no upper bound (up to today). Compute dates from today\'s date in the system prompt.'),
 });
 
 const regionSchema = z.enum(['NA', 'EU', 'APAC']);
@@ -38,10 +19,15 @@ const roleSchema = z.enum(['ADMIN', 'ANALYST', 'SUPPORT']);
 
 function withAudit<TArgs, TResult>(
   toolName: string,
+  permission: string,
   ctx: Context,
   fn: (args: TArgs) => Promise<TResult>,
 ): (args: TArgs) => Promise<TResult | { ok: false; error: string }> {
   return async (args: TArgs) => {
+    if (!ctx.permissions.includes(permission)) {
+      audit({ userId: ctx.userId, orgId: ctx.orgId, tool: toolName, args, allowed: false, reason: 'insufficient permissions', durationMs: 0 });
+      return { ok: false, error: `Your role (${ctx.role}) doesn't have permission to access this data.` };
+    }
     const start = Date.now();
     try {
       const result = await fn(args);
@@ -65,7 +51,7 @@ function withAudit<TArgs, TResult>(
         reason: message,
         durationMs: Date.now() - start,
       });
-      return { ok: false, error: 'Service error executing tool.' };
+      return { ok: false, error: message };
     }
   };
 }
@@ -80,15 +66,23 @@ const REGISTRY: Record<string, ToolDef> = {
     permission: 'READ_REVENUE',
     build: (ctx) =>
       tool(
-        withAudit('getRevenueReport', ctx, (args: RevenueReportArgs) => getRevenueReport(args, ctx)),
+        withAudit('getRevenueReport', 'READ_REVENUE', ctx, (args: RevenueReportArgs) => getRevenueReport(args, ctx)),
         {
           name: 'getRevenueReport',
           description:
-            "Get total revenue (sales minus refunds) for the caller's organization over a time range, optionally filtered by region or transaction type. Returns a single aggregate. Input must be { timeRange: { preset: '...' } } — always wrap preset inside timeRange.",
+            `Get aggregate stats computed over ALL matching transactions (not paginated). Returns:
+- totalRevenue: net revenue (sales minus refunds) — use for revenue queries
+- transactionCount: exact count — use for "how many transactions" queries
+- averageAmount: mean transaction amount — use for "average deal size" queries
+- maxAmount: largest single transaction — use for "biggest deal" queries
+- minAmount: smallest single transaction
+If transactionCount=0: no transactions found. If the queried period is entirely in the future, note that — don't report as missing historical data.
+If transactionCount>0 and totalRevenue=$0: sales were fully offset by refunds.
+Use this tool for ALL calculations. Never compute aggregates from listTransactions rows. Self-contained — do not follow up with listTransactions unless the user explicitly asked to see transaction rows.`,
           schema: z.object({
             timeRange: timeRangeSchema,
-            region: regionSchema.optional(),
-            type: txnTypeSchema.optional(),
+            region: regionSchema.optional().describe('Only set if user explicitly asks to filter by region.'),
+            type: txnTypeSchema.optional().describe('Only set if user explicitly asks to filter by type.'),
           }),
         },
       ),
@@ -98,14 +92,14 @@ const REGISTRY: Record<string, ToolDef> = {
     permission: 'READ_REVENUE',
     build: (ctx) =>
       tool(
-        withAudit('getRevenueBreakdown', ctx, (args: BreakdownArgs) => getRevenueBreakdown(args, ctx)),
+        withAudit('getRevenueBreakdown', 'READ_REVENUE', ctx, (args: BreakdownArgs) => getRevenueBreakdown(args, ctx)),
         {
           name: 'getRevenueBreakdown',
           description:
-            "Group revenue by region (NA/EU/APAC) or by calendar month (YYYY-MM) for the caller's organization over a time range. Use this for trend, comparison, or 'top X' questions.",
+            "Group revenue by a dimension over a time range. Returns an array of {group, totalRevenue, transactionCount} — one entry per group that has data. Use for trends, period-over-period comparisons, or regional breakdowns.",
           schema: z.object({
             timeRange: timeRangeSchema,
-            groupBy: z.enum(['region', 'month']),
+            groupBy: z.string().describe("'region' (NA/EU/APAC) | 'month' (YYYY-MM) | 'year' (YYYY) | 'quarter' (YYYY-Q#) | 'type' (sale/refund)."),
           }),
         },
       ),
@@ -115,16 +109,17 @@ const REGISTRY: Record<string, ToolDef> = {
     permission: 'READ_REVENUE',
     build: (ctx) =>
       tool(
-        withAudit('listTransactions', ctx, (args: ListTransactionsArgs) => listTransactions(args, ctx)),
+        withAudit('listTransactions', 'READ_REVENUE', ctx, (args: ListTransactionsArgs) => listTransactions(args, ctx)),
         {
           name: 'listTransactions',
           description:
-            "List individual transactions in the caller's organization, newest first. Capped at 100. Use for browsing recent activity or finding specific transactions.",
+            `List individual transactions newest first. Do not use for user, admin, or role-related questions — those require getUserDetails or listUsers. Omit timeRange entirely when no specific period is requested (e.g. "show recent transactions", "list all transactions", or any query without an explicit date range). Returns: totalCount (exact total before LIMIT), count (rows shown, capped at ${PAGE_SIZE}), hasMore, rows. Always present each returned row to the user first, then on a new line after the list: state "Showing [count] of [totalCount] total." If hasMore: true, follow that with: "Type 'next transactions' to load more, or filter by date range, region, or type." For any calculation (total, count, average, biggest), use getRevenueReport instead.`,
           schema: z.object({
             timeRange: timeRangeSchema.optional(),
-            region: regionSchema.optional(),
-            type: txnTypeSchema.optional(),
-            limit: z.number().int().min(1).max(100).optional(),
+            region: regionSchema.optional().describe('Only set if user explicitly asks to filter by region.'),
+            type: txnTypeSchema.optional().describe('Only set if user explicitly asks to filter by type.'),
+            limit: z.number().int().min(1).max(PAGE_SIZE).default(PAGE_SIZE).optional(),
+            offset: z.number().int().min(0).default(0).optional().describe('Rows to skip. Page N = offset (N-1) × 10. Only set if user explicitly asks for a specific page or offset.'),
           }),
         },
       ),
@@ -134,11 +129,11 @@ const REGISTRY: Record<string, ToolDef> = {
     permission: 'READ_USERS',
     build: (ctx) =>
       tool(
-        withAudit('getUserDetails', ctx, (args: GetUserDetailsArgs) => getUserDetails(args, ctx)),
+        withAudit('getUserDetails', 'READ_USERS', ctx, (args: GetUserDetailsArgs) => getUserDetails(args, ctx)),
         {
           name: 'getUserDetails',
           description:
-            "Look up a single user by email within the caller's organization. Returns the same 'not found' shape whether the email exists in a different org or not at all.",
+            "Look up a single user by email address — requires email, not name. Returns user fields (id, email, name, role) if found, or a not-found shape (same whether the email doesn't exist or belongs to a different org).",
           schema: z.object({
             email: z.string().email(),
           }),
@@ -150,13 +145,13 @@ const REGISTRY: Record<string, ToolDef> = {
     permission: 'READ_USERS',
     build: (ctx) =>
       tool(
-        withAudit('listUsers', ctx, (args: ListUsersArgs) => listUsers(args, ctx)),
+        withAudit('listUsers', 'READ_USERS', ctx, (args: ListUsersArgs) => listUsers(args, ctx)),
         {
           name: 'listUsers',
           description:
-            "List users in the caller's organization, optionally filtered by role (ADMIN/ANALYST/SUPPORT).",
+            `List users in the caller's organization, optionally filtered by role. Omit role entirely unless the user explicitly asks to filter by a specific role (e.g. "list admins", "show analysts") — never set role for "all users" or "list users" queries. Returns: totalCount (exact total), count (rows shown, capped at ${PAGE_SIZE}), hasMore, rows. Always present each returned row to the user. Always use totalCount when reporting how many users exist. If hasMore: true, say "showing [count] of [totalCount] total" and offer to filter by role.`,
           schema: z.object({
-            role: roleSchema.optional(),
+            role: roleSchema.optional().describe('Only set if user explicitly asks to filter by a specific role.'),
           }),
         },
       ),
@@ -164,9 +159,7 @@ const REGISTRY: Record<string, ToolDef> = {
 };
 
 export function getToolsForContext(ctx: Context): DynamicStructuredTool[] {
-  return Object.entries(REGISTRY)
-    .filter(([, def]) => ctx.permissions.includes(def.permission))
-    .map(([, def]) => def.build(ctx));
+  return Object.values(REGISTRY).map((def) => def.build(ctx));
 }
 
 export function listAvailableToolNames(ctx: Context): string[] {

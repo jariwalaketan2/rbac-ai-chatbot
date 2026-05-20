@@ -20,7 +20,7 @@ export function getModel(): SupportedModel {
           baseURL: process.env.OLLAMA_BASE_URL,
         },
         temperature: 0,
-        maxTokens: 1024,
+        maxTokens: 500,
       });
     } else {
       _model = new ChatOllama({

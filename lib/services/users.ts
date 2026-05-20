@@ -1,5 +1,6 @@
 import { sql } from '../db/client';
 import type { Context, Role } from '../auth/context';
+import { PAGE_SIZE } from './transactions';
 
 export type GetUserDetailsArgs = { email: string };
 
@@ -64,7 +65,9 @@ export type UserRow = {
 export type UserList = {
   orgId: string;
   filters: { role: Role | null };
+  totalCount: number;
   count: number;
+  hasMore: boolean;
   rows: UserRow[];
 };
 
@@ -74,18 +77,25 @@ export async function listUsers(
 ): Promise<UserList> {
   const role = args.role ?? null;
 
-  const rows = (await sql(
-    `SELECT id, email, full_name, role
+  const raw = (await sql(
+    `SELECT id, email, full_name, role, COUNT(*) OVER() AS total_count
      FROM users
      WHERE org_id = $1 AND ($2::text IS NULL OR role = $2)
-     ORDER BY email`,
-    [ctx.orgId, role],
-  )) as Array<{ id: string; email: string; full_name: string; role: Role }>;
+     ORDER BY email
+     LIMIT $3`,
+    [ctx.orgId, role, PAGE_SIZE + 1],
+  )) as Array<{ id: string; email: string; full_name: string; role: Role; total_count: number }>;
+
+  const totalCount = raw.length > 0 ? Number(raw[0].total_count) : 0;
+  const hasMore = raw.length > PAGE_SIZE;
+  const rows = hasMore ? raw.slice(0, PAGE_SIZE) : raw;
 
   return {
     orgId: ctx.orgId,
     filters: { role },
+    totalCount,
     count: rows.length,
+    hasMore,
     rows: rows.map((r) => ({
       id: r.id,
       email: r.email,
