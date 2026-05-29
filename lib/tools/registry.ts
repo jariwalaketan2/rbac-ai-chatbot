@@ -17,6 +17,12 @@ const regionSchema = z.enum(['NA', 'EU', 'APAC']);
 const txnTypeSchema = z.enum(['sale', 'refund']);
 const roleSchema = z.enum(['ADMIN', 'ANALYST', 'SUPPORT']);
 
+// LLMs sometimes send "" for optional enum fields instead of omitting them.
+// z.preprocess coerces that to undefined before Zod validates.
+const optionalRegion = z.preprocess((v) => (v === '' || v == null ? undefined : v), regionSchema.optional());
+const optionalTxnType = z.preprocess((v) => (v === '' || v == null ? undefined : v), txnTypeSchema.optional());
+const optionalRole = z.preprocess((v) => (v === '' || v == null ? undefined : v), roleSchema.optional());
+
 function withAudit<TArgs, TResult>(
   toolName: string,
   permission: string,
@@ -81,8 +87,8 @@ If transactionCount>0 and totalRevenue=$0: sales were fully offset by refunds.
 Use this tool for ALL calculations. Never compute aggregates from listTransactions rows. Self-contained — do not follow up with listTransactions unless the user explicitly asked to see transaction rows.`,
           schema: z.object({
             timeRange: timeRangeSchema,
-            region: regionSchema.optional().describe('Only set if user explicitly asks to filter by region.'),
-            type: txnTypeSchema.optional().describe('Only set if user explicitly asks to filter by type.'),
+            region: optionalRegion.describe('Only set if user explicitly asks to filter by region.'),
+            type: optionalTxnType.describe('Only set if user explicitly asks to filter by type.'),
           }),
         },
       ),
@@ -116,8 +122,8 @@ Use this tool for ALL calculations. Never compute aggregates from listTransactio
             `List individual transactions newest first. Do not use for user, admin, or role-related questions — those require getUserDetails or listUsers. Omit timeRange entirely when no specific period is requested (e.g. "show recent transactions", "list all transactions", or any query without an explicit date range). Returns: totalCount (exact total before LIMIT), count (rows shown, capped at ${PAGE_SIZE}), hasMore, rows. Always present each returned row to the user first, then on a new line after the list: state "Showing [count] of [totalCount] total." If hasMore: true, follow that with: "Type 'next transactions' to load more, or filter by date range, region, or type." For any calculation (total, count, average, biggest), use getRevenueReport instead.`,
           schema: z.object({
             timeRange: timeRangeSchema.optional(),
-            region: regionSchema.optional().describe('Only set if user explicitly asks to filter by region.'),
-            type: txnTypeSchema.optional().describe('Only set if user explicitly asks to filter by type.'),
+            region: optionalRegion.describe('Only set if user explicitly asks to filter by region.'),
+            type: optionalTxnType.describe('Only set if user explicitly asks to filter by type.'),
             limit: z.number().int().min(1).max(PAGE_SIZE).default(PAGE_SIZE).optional(),
             offset: z.number().int().min(0).default(0).optional().describe('Rows to skip. Page N = offset (N-1) × 10. Only set if user explicitly asks for a specific page or offset.'),
           }),
@@ -151,7 +157,7 @@ Use this tool for ALL calculations. Never compute aggregates from listTransactio
           description:
             `List users in the caller's organization, optionally filtered by role. Omit role entirely unless the user explicitly asks to filter by a specific role (e.g. "list admins", "show analysts") — never set role for "all users" or "list users" queries. Returns: totalCount (exact total), count (rows shown, capped at ${PAGE_SIZE}), hasMore, rows. Always present each returned row to the user. Always use totalCount when reporting how many users exist. If hasMore: true, say "showing [count] of [totalCount] total" and offer to filter by role.`,
           schema: z.object({
-            role: roleSchema.optional().describe('Only set if user explicitly asks to filter by a specific role.'),
+            role: optionalRole.describe('Only set if user explicitly asks to filter by a specific role.'),
           }),
         },
       ),
@@ -159,7 +165,9 @@ Use this tool for ALL calculations. Never compute aggregates from listTransactio
 };
 
 export function getToolsForContext(ctx: Context): DynamicStructuredTool[] {
-  return Object.values(REGISTRY).map((def) => def.build(ctx));
+  return Object.entries(REGISTRY)
+    .filter(([, def]) => ctx.permissions.includes(def.permission))
+    .map(([, def]) => def.build(ctx));
 }
 
 export function listAvailableToolNames(ctx: Context): string[] {
