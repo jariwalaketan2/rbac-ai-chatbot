@@ -2,6 +2,8 @@
 
 RBAC/ABAC-gated AI chatbot for internal analytics. Users query revenue, transactions, and user data through a natural language interface. All answers are grounded in live DB tool calls — no hallucinated numbers.
 
+> See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design doc (RBAC/ABAC model, streaming protocol, tool registry, security defenses). This README covers setup and a quick architecture overview.
+
 ---
 
 ## Stack
@@ -9,11 +11,11 @@ RBAC/ABAC-gated AI chatbot for internal analytics. Users query revenue, transact
 | Layer | Technology |
 |---|---|
 | Frontend | Next.js 15 App Router |
-| LLM Runtime | Ollama (`qwen2.5:7b`) |
-| LLM Framework | LangChain + LangGraph ReAct agent |
+| LLM Framework | LangChain + LangGraph `createReactAgent` (ReAct loop, `recursionLimit: 25`) |
+| LLM Runtime | Dual-mode: local Ollama (`qwen3.5:9b`) **or** vLLM on Kaggle T4 via OpenAI-compat endpoint (`qwen3:8b`) |
 | Database | Neon (PostgreSQL serverless) |
 | Auth/RBAC | Header-based user context + permission-scoped tools |
-| GPU Inference (POC) | Google Colab T4 + cloudflared tunnel |
+| GPU Inference (POC) | Kaggle T4 + vLLM + cloudflared tunnel (current); Colab + Ollama (legacy, superseded) |
 
 ---
 
@@ -22,8 +24,9 @@ RBAC/ABAC-gated AI chatbot for internal analytics. Users query revenue, transact
 ### Prerequisites
 
 - Node.js 20+
-- Ollama installed: `curl -fsSL https://ollama.com/install.sh | sh`
-- Model pulled: `ollama pull qwen2.5:7b`
+- Either:
+  - Ollama installed locally: `curl -fsSL https://ollama.com/install.sh | sh` then `ollama pull qwen3.5:9b`, **or**
+  - A running Kaggle vLLM tunnel (see [GPU Inference](#gpu-inference-poc) below)
 
 ### Setup
 
@@ -39,9 +42,17 @@ npm run dev
 ```env
 DATABASE_URL=postgresql://user:pass@host/db?sslmode=require
 
-OLLAMA_MODEL=qwen2.5:7b
+# Local Ollama:
+OLLAMA_MODEL=qwen3.5:9b
 OLLAMA_BASE_URL=http://localhost:11434
+
+# OR vLLM on Kaggle (OpenAI-compat) — set OLLAMA_BASE_URL to end in /v1:
+# OLLAMA_MODEL=qwen3:8b
+# OLLAMA_BASE_URL=https://<tunnel>.trycloudflare.com/v1
+# OPENAI_API_KEY=vllm   # any string works, vLLM doesn't validate it
 ```
+
+`lib/llm/model.ts` picks the backend automatically: if `OLLAMA_BASE_URL` ends with `/v1`, it uses `ChatOpenAI` against the vLLM endpoint; otherwise it uses `ChatOllama` against a local Ollama server.
 
 ### Send a query
 
@@ -54,13 +65,31 @@ curl -X POST http://localhost:3000/api/chat \
 
 ---
 
-## Google Colab GPU Inference (POC)
+## GPU Inference (POC)
 
-> **Notebook:** [`colab/ollama_gpu_setup.ipynb`](colab/ollama_gpu_setup.ipynb) — open in Colab, enable T4 GPU, run cells top to bottom.
+Running a 7-9B model on CPU (e.g. i5-6300U) is far too slow for interactive use — prefill alone can take minutes per request. The POC offloads inference to a free GPU notebook and exposes it to the local Next.js app via a cloudflared tunnel.
 
-When running on CPU (e.g. i5-6300U), `qwen2.5:7b` prefill alone takes ~250s per request — well over Ollama's 5-minute hard timeout. The solution for the POC is to offload inference to a free Colab T4 GPU (~4s per query) and expose it to the local Next.js app via a cloudflared tunnel.
+### Current: Kaggle T4 + vLLM
 
-### Why this works
+> **Notebook:** [`kaggle/chatbot_hosting_llm_code.ipynb`](kaggle/chatbot_hosting_llm_code.ipynb) — open in Kaggle, enable T4 GPU, run cells top to bottom.
+
+```
+Next.js app (local)
+    ↓ HTTP
+cloudflared tunnel (public HTTPS URL, .../v1)
+    ↓ proxied to Kaggle
+vLLM OpenAI-compat server (port 8000)
+    ↓
+qwen3:8b on T4 GPU
+```
+
+vLLM exposes a native OpenAI-compatible `/v1/chat/completions` endpoint, so no host-header proxy workaround is needed (unlike the old Ollama+Colab setup below). Once the notebook prints the tunnel URL, set `OLLAMA_BASE_URL=https://<tunnel>.trycloudflare.com/v1` in `.env.local` and restart `npm run dev`.
+
+**Note:** the tunnel URL changes every time the Kaggle session restarts — update `.env.local` and restart the dev server each time.
+
+### Legacy: Colab T4 + Ollama (superseded)
+
+> **Notebook:** [`colab/chatbot_hosting_llm_code.ipynb`](colab/chatbot_hosting_llm_code.ipynb). Kept for reference; the Kaggle/vLLM path above is the current GPU backend.
 
 ```
 Next.js app (local)
@@ -74,208 +103,7 @@ Ollama serve (port 11434, OLLAMA_ORIGINS=*)
 qwen2.5:7b on T4 GPU
 ```
 
-Ollama rejects requests whose `Host` header doesn't match `localhost` (DNS rebinding protection). The Flask proxy on port 11435 strips the cloudflare `Host` header before forwarding to Ollama, bypassing this check.
-
----
-
-### Colab Setup — Full Code
-
-Open a new Google Colab notebook, enable GPU runtime (**Runtime → Change runtime type → T4 GPU**), then run these cells in order.
-
-#### Cell 1 — Install Ollama
-
-```python
-import subprocess, time
-
-result = subprocess.run(
-    'curl -fsSL https://ollama.com/install.sh | sh',
-    shell=True, capture_output=True, text=True
-)
-print(result.stdout[-500:])
-print(result.stderr[-200:])
-```
-
-#### Cell 2 — Start Ollama with origins open
-
-```python
-import subprocess, time, os, requests
-
-subprocess.run(['pkill', '-9', '-f', 'ollama'], capture_output=True)
-time.sleep(2)
-
-env = os.environ.copy()
-env['OLLAMA_ORIGINS'] = '*'
-env['OLLAMA_HOST'] = '0.0.0.0:11434'
-
-proc = subprocess.Popen(
-    ['ollama', 'serve'],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-    env=env
-)
-time.sleep(4)
-
-r = requests.get('http://localhost:11434/api/tags')
-print('✓ Ollama running:', r.status_code)
-```
-
-#### Cell 3 — Pull the model
-
-```python
-import subprocess
-
-result = subprocess.run(
-    ['ollama', 'pull', 'qwen2.5:7b'],
-    capture_output=True, text=True
-)
-print(result.stdout[-300:])
-
-# Verify
-r = requests.get('http://localhost:11434/api/tags')
-models = [m['name'] for m in r.json().get('models', [])]
-print('Models available:', models)
-```
-
-#### Cell 4 — Install cloudflared
-
-```python
-import subprocess
-
-subprocess.run([
-    'wget', '-q',
-    'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',
-    '-O', '/usr/local/bin/cloudflared'
-], check=True)
-subprocess.run(['chmod', '+x', '/usr/local/bin/cloudflared'], check=True)
-print('✓ cloudflared installed')
-```
-
-#### Cell 5 — Start Flask proxy on port 11435
-
-Ollama blocks requests with foreign `Host` headers (from the tunnel). This proxy strips the header before forwarding to Ollama.
-
-```python
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import urllib.request
-
-class OllamaProxy(BaseHTTPRequestHandler):
-    def do_request(self):
-        length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(length) if length > 0 else None
-        headers = {k: v for k, v in self.headers.items()
-                   if k.lower() not in ('host', 'content-length')}
-        if body:
-            headers['Content-Length'] = str(len(body))
-        try:
-            req = urllib.request.Request(
-                f'http://localhost:11434{self.path}',
-                data=body, headers=headers, method=self.command
-            )
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                self.send_response(resp.status)
-                for k, v in resp.headers.items():
-                    if k.lower() != 'transfer-encoding':
-                        self.send_header(k, v)
-                self.end_headers()
-                while chunk := resp.read(4096):
-                    self.wfile.write(chunk)
-        except Exception as e:
-            self.send_error(502, str(e))
-
-    do_GET = do_POST = do_PUT = do_DELETE = do_request
-    def log_message(self, *_): pass
-
-server = HTTPServer(('0.0.0.0', 11435), OllamaProxy)
-threading.Thread(target=server.serve_forever, daemon=True).start()
-print('✓ Proxy on :11435')
-```
-
-#### Cell 6 — Start cloudflared tunnel
-
-```python
-import subprocess, threading, time, re
-
-subprocess.run(['pkill', '-f', 'cloudflared'], capture_output=True)
-time.sleep(2)
-
-proc = subprocess.Popen(
-    ['cloudflared', 'tunnel', '--url', 'http://localhost:11435'],
-    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-)
-
-tunnel_url = None
-
-def read():
-    global tunnel_url
-    for line in proc.stdout:
-        print(line, end='')
-        if 'trycloudflare.com' in line and not tunnel_url:
-            m = re.search(r'https://[a-z0-9\-]+\.trycloudflare\.com', line)
-            if m:
-                tunnel_url = m.group(0)
-                print(f'\n✓ Tunnel URL: {tunnel_url}')
-
-threading.Thread(target=read, daemon=False).start()
-time.sleep(10)
-print('Copy this URL into .env.local as OLLAMA_BASE_URL:', tunnel_url)
-```
-
-#### Cell 7 — Verify end-to-end
-
-```python
-import requests
-
-# Local Ollama
-r1 = requests.get('http://localhost:11434/api/tags', timeout=5)
-print('✓ Ollama local:', r1.status_code)
-
-# Via tunnel
-r2 = requests.get(f'{tunnel_url}/api/tags', timeout=10)
-print('✓ Tunnel:', r2.status_code)  # must be 200, not 403/530
-```
-
-#### Cell 8 — Keep-alive (run while using the app)
-
-Colab disconnects after ~90 min of inactivity. Keep this cell running while using the chatbot.
-
-```python
-import time
-print('Keep-alive running — interrupt to stop')
-while True:
-    time.sleep(60)
-```
-
----
-
-### Update `.env.local`
-
-After Cell 6 prints the tunnel URL, update your local `.env.local`:
-
-```env
-OLLAMA_BASE_URL=https://<your-tunnel-subdomain>.trycloudflare.com
-```
-
-Then restart the dev server:
-
-```bash
-# Ctrl+C to stop, then:
-npm run dev
-```
-
-**Note:** The tunnel URL changes every time you restart the Colab session. Update `.env.local` and restart the dev server each time.
-
----
-
-### Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| `403` from tunnel | `OLLAMA_ORIGINS=*` not set on Ollama process | Re-run Cell 2 |
-| `530` from Cloudflare | Proxy not running or erroring | Re-run Cell 5 |
-| `502 Bad Gateway` | Ollama process died | Re-run Cell 2, then Cell 6 |
-| Query times out locally | CPU too slow for 7b model | Use Colab GPU setup |
-| New URL needed | Colab session restarted | Re-run Cell 6, update `.env.local` |
+Ollama rejects requests whose `Host` header doesn't match `localhost` (DNS rebinding protection), which is why this path needed the extra Flask proxy to strip the tunnel's `Host` header — vLLM has no such restriction.
 
 ---
 
@@ -289,34 +117,45 @@ POST /api/chat  { message: string }
 Header: x-user-id: <user>
     │
     ▼
-buildContextFromUserId()         ← resolves org, role, permissions from DB
+buildContextFromUserId()          ← resolves orgId, role, permissions from DB
     │
     ▼
-streamQuery(message, ctx)
+warmDb()
     │
-    ├─ buildSystemPrompt()       ← injects org, role, rules
-    ├─ getToolsForContext(ctx)   ← filters tools by RBAC permissions
-    └─ createReactAgent()        ← LangGraph ReAct loop
+    ▼
+LangGraph ReAct Agent (createReactAgent, recursionLimit: 25)
+    │
+    ├─ buildSystemPrompt()        ← injects org, role, pre-computed date ranges, rules
+    ├─ getToolsForContext(ctx)    ← RBAC-filtered tools bound at agent-creation time
+    └─ LLM (ChatOpenAI / ChatOllama — dual backend, see lib/llm/model.ts)
            │
-           ├─ LLM decides tool → tool executes DB query → result back to LLM
+           ├─ LLM decides tool → tool executes DB query (orgId injected from ctx) → result back to LLM
            ├─ LLM decides tool → ...  (up to 25 steps)
            └─ LLM writes final answer (grounded in tool results only)
     │
     ▼
+Hallucination guard                ← blocks numeric answers with no tool call this turn
+    │
+    ▼
 NDJSON stream of events:
+  { type: 'metadata', provider, availableTools }
+  { type: 'debug', systemPrompt, toolSchemas }
   { type: 'tool_call', name, args }
   { type: 'tool_result', name, result }
   { type: 'text_chunk', text }
-  { type: 'done', steps, refusal }
+  { type: 'thinking_chunk', text }   ← model <think> blocks, not shown to user
+  { type: 'guard', fired, reason, textSample }
+  { type: 'done', steps, refusal, usedFinalize }
+  { type: 'error', message, retryable }
 ```
 
 ## RBAC / ABAC
 
-Permissions are resolved per user at request time. Tools are filtered so a user can only call tools their permissions allow:
+Permissions are resolved per user at request time. Tools are filtered so a user can only call tools their permissions allow, and every tool query is automatically scoped to the user's `orgId` — cross-org data is structurally inaccessible (the LLM never receives `orgId` as an argument).
 
 | Permission | Tools unlocked |
 |---|---|
 | `READ_REVENUE` | `getRevenueReport`, `getRevenueBreakdown`, `listTransactions` |
 | `READ_USERS` | `getUserDetails`, `listUsers` |
 
-All tool queries are automatically scoped to the user's `orgId` — cross-org data is structurally inaccessible.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) §5–§7 for the full tool registry, system prompt rules, and security defenses (prompt injection, cross-org lookup, hallucination guard).
